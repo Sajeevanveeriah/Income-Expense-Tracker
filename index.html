@@ -1262,13 +1262,156 @@
                 const data = await file.arrayBuffer();
                 const workbook = XLSX.read(data);
 
-                let importedCount = 0;
+                let importedTransactions = 0;
+                let importedBudgets = 0;
+                let importedDebts = 0;
                 let errorCount = 0;
+
+                console.log('Processing workbook with sheets:', workbook.SheetNames);
 
                 for (const sheetName of workbook.SheetNames) {
                     const sheet = workbook.Sheets[sheetName];
                     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
 
+                    console.log(`Processing sheet: ${sheetName}, rows: ${rows.length}`);
+
+                    if (rows.length === 0) continue;
+
+                    const sheetNameLower = sheetName.toLowerCase();
+
+                    // Handle Budget sheet
+                    if (sheetNameLower.includes('budget')) {
+                        console.log('Processing budget sheet');
+                        try {
+                            // Expected format: Category | Limit (or similar)
+                            // Find header row
+                            let headerRowIndex = -1;
+                            for (let i = 0; i < Math.min(5, rows.length); i++) {
+                                const row = rows[i];
+                                if (row && row.some(cell =>
+                                    cell && typeof cell === 'string' &&
+                                    (cell.toLowerCase().includes('category') || cell.toLowerCase().includes('budget'))
+                                )) {
+                                    headerRowIndex = i;
+                                    break;
+                                }
+                            }
+
+                            if (headerRowIndex === -1) {
+                                console.warn('Budget sheet: Could not find header row');
+                                continue;
+                            }
+
+                            const headerRow = rows[headerRowIndex];
+                            const categoryColIndex = headerRow.findIndex(cell =>
+                                cell && typeof cell === 'string' && cell.toLowerCase().includes('category')
+                            );
+                            const limitColIndex = headerRow.findIndex(cell =>
+                                cell && typeof cell === 'string' &&
+                                (cell.toLowerCase().includes('limit') || cell.toLowerCase().includes('budget') || cell.toLowerCase().includes('amount'))
+                            );
+
+                            if (categoryColIndex === -1 || limitColIndex === -1) {
+                                console.warn('Budget sheet: Could not find Category or Limit columns');
+                                continue;
+                            }
+
+                            for (let i = headerRowIndex + 1; i < rows.length; i++) {
+                                const row = rows[i];
+                                if (!row || row.length === 0) continue;
+
+                                const category = row[categoryColIndex];
+                                const limit = parseFloat(row[limitColIndex]);
+
+                                if (!category || !limit || limit <= 0) continue;
+
+                                // Check if budget already exists
+                                const existingBudgets = await getAllBudgets();
+                                const existing = existingBudgets.find(b => b.category === category);
+
+                                if (existing) {
+                                    existing.limit = limit;
+                                    await updateBudget(existing);
+                                } else {
+                                    await addBudget({ category, limit });
+                                }
+                                importedBudgets++;
+                            }
+                        } catch (err) {
+                            console.error('Error importing budgets:', err);
+                            errorCount++;
+                        }
+                        continue;
+                    }
+
+                    // Handle Debt sheet
+                    if (sheetNameLower.includes('debt')) {
+                        console.log('Processing debt sheet');
+                        try {
+                            // Expected format: Name | Total Amount | Amount Paid (optional)
+                            let headerRowIndex = -1;
+                            for (let i = 0; i < Math.min(5, rows.length); i++) {
+                                const row = rows[i];
+                                if (row && row.some(cell =>
+                                    cell && typeof cell === 'string' &&
+                                    (cell.toLowerCase().includes('name') || cell.toLowerCase().includes('debt'))
+                                )) {
+                                    headerRowIndex = i;
+                                    break;
+                                }
+                            }
+
+                            if (headerRowIndex === -1) {
+                                console.warn('Debt sheet: Could not find header row');
+                                continue;
+                            }
+
+                            const headerRow = rows[headerRowIndex];
+                            const nameColIndex = headerRow.findIndex(cell =>
+                                cell && typeof cell === 'string' &&
+                                (cell.toLowerCase().includes('name') || cell.toLowerCase().includes('debt'))
+                            );
+                            const totalColIndex = headerRow.findIndex(cell =>
+                                cell && typeof cell === 'string' &&
+                                (cell.toLowerCase().includes('total') || cell.toLowerCase().includes('amount'))
+                            );
+                            const paidColIndex = headerRow.findIndex(cell =>
+                                cell && typeof cell === 'string' && cell.toLowerCase().includes('paid')
+                            );
+
+                            if (nameColIndex === -1 || totalColIndex === -1) {
+                                console.warn('Debt sheet: Could not find Name or Total columns');
+                                continue;
+                            }
+
+                            for (let i = headerRowIndex + 1; i < rows.length; i++) {
+                                const row = rows[i];
+                                if (!row || row.length === 0) continue;
+
+                                const name = row[nameColIndex];
+                                const totalAmount = parseFloat(row[totalColIndex]);
+                                const amountPaid = paidColIndex !== -1 ? parseFloat(row[paidColIndex]) || 0 : 0;
+
+                                if (!name || !totalAmount || totalAmount <= 0) continue;
+
+                                const debt = {
+                                    name,
+                                    totalAmount,
+                                    amountPaid,
+                                    payments: []
+                                };
+
+                                await addDebt(debt);
+                                importedDebts++;
+                            }
+                        } catch (err) {
+                            console.error('Error importing debts:', err);
+                            errorCount++;
+                        }
+                        continue;
+                    }
+
+                    // Handle Monthly/Transaction sheets
                     if (rows.length < 4) continue;
 
                     // Check header format (row 0: CBA/Westpac, row 2: column headers)
@@ -1276,45 +1419,67 @@
                     const headerRow2 = rows[2];
 
                     // Find CBA and Westpac sections
-                    let cbaCol = headerRow0.findIndex(cell => cell === 'CBA');
-                    let westpacCol = headerRow0.findIndex(cell => cell === 'Westpac');
+                    let cbaCol = -1;
+                    let westpacCol = -1;
+
+                    // Search for CBA and Westpac in first few rows
+                    for (let rowIdx = 0; rowIdx < Math.min(3, rows.length); rowIdx++) {
+                        const row = rows[rowIdx];
+                        if (!row) continue;
+
+                        for (let colIdx = 0; colIdx < row.length; colIdx++) {
+                            const cell = row[colIdx];
+                            if (cell && typeof cell === 'string') {
+                                if (cell.toUpperCase().includes('CBA') && cbaCol === -1) {
+                                    cbaCol = colIdx;
+                                    console.log(`Found CBA at row ${rowIdx}, col ${colIdx}`);
+                                }
+                                if (cell.toUpperCase().includes('WESTPAC') && westpacCol === -1) {
+                                    westpacCol = colIdx;
+                                    console.log(`Found Westpac at row ${rowIdx}, col ${colIdx}`);
+                                }
+                            }
+                        }
+                    }
 
                     if (cbaCol === -1 && westpacCol === -1) {
-                        console.warn(`Sheet ${sheetName}: Invalid format (no CBA/Westpac headers)`);
+                        console.warn(`Sheet ${sheetName}: No CBA/Westpac headers found, skipping`);
                         continue;
                     }
 
                     // Process CBA transactions
                     if (cbaCol !== -1) {
+                        console.log(`Processing CBA transactions starting at column ${cbaCol}`);
                         for (let i = 3; i < rows.length; i++) {
                             try {
                                 const row = rows[i];
                                 if (!row || row.length === 0) continue;
 
-                                const description = row[cbaCol + 1];
-                                if (!description || description === 'Balance BF') continue;
-
                                 const dateValue = row[cbaCol];
+                                const description = row[cbaCol + 1];
                                 const category = row[cbaCol + 2] || 'Other';
                                 const credit = parseFloat(row[cbaCol + 3]) || 0;
                                 const debit = parseFloat(row[cbaCol + 4]) || 0;
 
+                                if (!description || description === 'Balance BF' || description === '') continue;
                                 if (!dateValue || (credit === 0 && debit === 0)) continue;
 
                                 // Parse date
                                 let date;
                                 if (typeof dateValue === 'number') {
                                     // Excel date serial number
-                                    date = XLSX.SSF.parse_date_code(dateValue);
-                                    date = new Date(date.y, date.m - 1, date.d).toISOString().split('T')[0];
-                                } else {
+                                    const parsed = XLSX.SSF.parse_date_code(dateValue);
+                                    date = new Date(parsed.y, parsed.m - 1, parsed.d).toISOString().split('T')[0];
+                                } else if (typeof dateValue === 'string') {
                                     date = new Date(dateValue).toISOString().split('T')[0];
+                                } else {
+                                    continue;
                                 }
 
                                 const transaction = {
                                     date,
-                                    description,
-                                    category,
+                                    description: String(description).trim(),
+                                    category: String(category).trim(),
                                     account: 'CBA',
                                     type: credit > 0 ? 'income' : 'expense',
                                     amount: credit > 0 ? credit : debit,
@@ -1322,7 +1487,7 @@
                                 };
 
                                 await addTransaction(transaction);
-                                importedCount++;
+                                importedTransactions++;
                             } catch (err) {
                                 console.error(`Error importing CBA row ${i}:`, err);
                                 errorCount++;
@@ -1332,34 +1497,36 @@
 
                     // Process Westpac transactions
                     if (westpacCol !== -1) {
+                        console.log(`Processing Westpac transactions starting at column ${westpacCol}`);
                         for (let i = 3; i < rows.length; i++) {
                             try {
                                 const row = rows[i];
                                 if (!row || row.length === 0) continue;
 
-                                const description = row[westpacCol + 1];
-                                if (!description || description === 'Balance BF') continue;
-
                                 const dateValue = row[westpacCol];
+                                const description = row[westpacCol + 1];
                                 const category = row[westpacCol + 2] || 'Other';
                                 const credit = parseFloat(row[westpacCol + 3]) || 0;
                                 const debit = parseFloat(row[westpacCol + 4]) || 0;
 
+                                if (!description || description === 'Balance BF' || description === '') continue;
                                 if (!dateValue || (credit === 0 && debit === 0)) continue;
 
                                 // Parse date
                                 let date;
                                 if (typeof dateValue === 'number') {
-                                    date = XLSX.SSF.parse_date_code(dateValue);
-                                    date = new Date(date.y, date.m - 1, date.d).toISOString().split('T')[0];
-                                } else {
+                                    const parsed = XLSX.SSF.parse_date_code(dateValue);
+                                    date = new Date(parsed.y, parsed.m - 1, parsed.d).toISOString().split('T')[0];
+                                } else if (typeof dateValue === 'string') {
                                     date = new Date(dateValue).toISOString().split('T')[0];
+                                } else {
+                                    continue;
                                 }
 
                                 const transaction = {
                                     date,
-                                    description,
-                                    category,
+                                    description: String(description).trim(),
+                                    category: String(category).trim(),
                                     account: 'Westpac',
                                     type: credit > 0 ? 'income' : 'expense',
                                     amount: credit > 0 ? credit : debit,
@@ -1367,7 +1534,7 @@
                                 };
 
                                 await addTransaction(transaction);
-                                importedCount++;
+                                importedTransactions++;
                             } catch (err) {
                                 console.error(`Error importing Westpac row ${i}:`, err);
                                 errorCount++;
@@ -1376,12 +1543,22 @@
                     }
                 }
 
-                alert(`Import complete!\n${importedCount} transactions imported${errorCount > 0 ? `\n${errorCount} rows skipped due to errors` : ''}`);
+                const summary = [];
+                if (importedTransactions > 0) summary.push(`${importedTransactions} transactions`);
+                if (importedBudgets > 0) summary.push(`${importedBudgets} budgets`);
+                if (importedDebts > 0) summary.push(`${importedDebts} debts`);
+
+                const message = `Import complete!\n${summary.join(', ')}${errorCount > 0 ? `\n${errorCount} rows skipped due to errors` : ''}`;
+                alert(message);
+
                 e.target.value = '';
                 loadTransactions();
                 updateAccountBalances();
                 updateDashboard();
+                loadBudgets();
+                loadDebts();
             } catch (error) {
+                console.error('Excel import error:', error);
                 alert('Error importing Excel file: ' + error.message);
                 e.target.value = '';
             }
